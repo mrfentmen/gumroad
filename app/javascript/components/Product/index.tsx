@@ -71,6 +71,7 @@ import { getBundleComparisonPriceCents, getStandalonePrice } from "$app/componen
 import { PurchaseButton } from "$app/components/Product/PurchaseButton";
 import { initialOptionId } from "$app/components/Product/purchaseReadiness";
 import { Ribbon } from "$app/components/Product/Ribbon";
+import type { SelectionDiscounts, SelectionQuote } from "$app/components/Product/selectionDiscounts";
 import { ShareSection } from "$app/components/Product/ShareSection";
 import { Thumbnail } from "$app/components/Product/Thumbnail";
 import { InstallmentPlan } from "$app/components/ProductEdit/state";
@@ -280,6 +281,7 @@ export type Props = {
   purchase: Purchase | null;
   discount_code: ProductDiscount | null;
   sale_label?: string | null;
+  selection_discounts?: SelectionDiscounts | null;
   wishlists: WishlistForProduct[];
 };
 
@@ -291,6 +293,8 @@ export const Product = ({
   purchase,
   discountCode: initialDiscountCode,
   saleLabel,
+  selectionDiscountCode,
+  quote,
   ctaLabel,
   selection,
   setSelection,
@@ -306,6 +310,10 @@ export const Product = ({
   discountCode?: ProductDiscount | null;
   // The seller's sale label; only sent when the displayed discount is their auto-applied code.
   saleLabel?: string | null | undefined;
+  // The server's code for each option and for renting, when they get different ones; see useSelectionDiscounts.
+  selectionDiscountCode?: ((optionId: string | null, rent: boolean) => ProductDiscount | null) | undefined;
+  // Whether the codes above were quoted for the current selection; the buy buttons wait until they are.
+  quote?: SelectionQuote | undefined;
   ctaLabel?: string | undefined;
   selection: PriceSelection;
   setSelection?: React.Dispatch<React.SetStateAction<PriceSelection>>;
@@ -321,11 +329,12 @@ export const Product = ({
   scaleLongTitle?: boolean;
 }) => {
   const notForSaleMessage = getNotForSaleMessage(product);
-  const [discountCode, setDiscountCode] = React.useState(initialDiscountCode);
-
-  React.useEffect(() => {
-    setDiscountCode(initialDiscountCode);
-  }, [initialDiscountCode]);
+  // Kept by code, so another option's quote for an expired code cannot bring it back.
+  const [expiredCodes, setExpiredCodes] = React.useState<string[]>([]);
+  const isExpired = (code: ProductDiscount | null | undefined) => !!code?.valid && expiredCodes.includes(code.code);
+  const discountCode: ProductDiscount | null | undefined = isExpired(initialDiscountCode)
+    ? { valid: false, error_code: "inactive" }
+    : initialDiscountCode;
 
   const discount = discountCode?.valid ? discountCode.discount : null;
   const selectionAttributes = applySelection(product, discount, selection);
@@ -386,16 +395,29 @@ export const Product = ({
   // applySelection already drops a code whose minimum quantity or amount this selection misses.
   const codeDiscounts = (attributes: typeof selectionAttributes) =>
     !attributes.pppDiscounted && attributes.discountedPriceCents < attributes.priceCents;
+  const sameCode = (left: ProductDiscount | null, right: ProductDiscount | null) =>
+    !!left?.valid && !!right?.valid && left.code === right.code;
+  // The code that prices a choice the buyer could make, such as another option row or the rent tab.
+  const rowDiscount = (rowSelection: PriceSelection) => {
+    if (!selectionDiscountCode || (rowSelection.optionId === null && product.options.length > 0)) return discount;
+    const rowCode = selectionDiscountCode(rowSelection.optionId, rowSelection.rent);
+    return rowCode?.valid && !isExpired(rowCode) ? withConfiguredOncePerCartAmount(rowCode.discount) : null;
+  };
   // With no option picked, each visible option shows its own price, so any discounted one earns the label.
   const showSaleLabel =
     !!saleLabel &&
-    discountCode === initialDiscountCode &&
     !!discountCode?.valid &&
     (product.options.length > 0 && selectedOption === null
       ? product.options.some(
           (option) =>
             !(product.hide_sold_out_variants && option.quantity_left === 0) &&
-            codeDiscounts(applySelection(product, discount, { ...selection, optionId: option.id })),
+            (!selectionDiscountCode || sameCode(selectionDiscountCode(option.id, selection.rent), discountCode)) &&
+            codeDiscounts(
+              applySelection(product, rowDiscount({ ...selection, optionId: option.id }), {
+                ...selection,
+                optionId: option.id,
+              }),
+            ),
         )
       : codeDiscounts(selectionAttributes));
 
@@ -654,7 +676,7 @@ export const Product = ({
                       <DiscountExpirationCountdown
                         expiresAt={new Date(discountCode.discount.expires_at)}
                         showEndDate={showSaleLabel}
-                        onExpiration={() => setDiscountCode({ valid: false, error_code: "inactive" })}
+                        onExpiration={() => setExpiredCodes((codes) => [...codes, discountCode.code])}
                       />
                     ) : null}
                   </div>
@@ -677,6 +699,7 @@ export const Product = ({
             selection={selection}
             setSelection={setSelection}
             discount={discountCode?.valid ? withConfiguredOncePerCartAmount(discountCode.discount) : null}
+            rowDiscount={selectionDiscountCode ? rowDiscount : undefined}
             ref={configurationSelectorRef}
           />
           {product.ppp_details && pppDiscounted ? (
@@ -712,11 +735,20 @@ export const Product = ({
               {product.duration_in_months === 1 ? "one month" : `${product.duration_in_months} months`}
             </Alert>
           ) : null}
+          {quote?.state === "failed" ? (
+            <Alert role="alert" variant="danger">
+              <div className="flex flex-col gap-4">
+                We couldn't check the discount for this selection.
+                <Button onClick={quote.retry}>Try again</Button>
+              </div>
+            </Alert>
+          ) : null}
           <PurchaseButton
             ref={ctaButtonRef}
             product={product}
             purchase={purchase}
             discountCode={discountCode ?? null}
+            pricePending={!!quote && quote.state !== "ready"}
             selection={selection}
             label={ctaLabel}
             showInstallmentPlanNotes
